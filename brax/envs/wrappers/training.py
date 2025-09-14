@@ -137,6 +137,7 @@ class EpisodeWrapper(Wrapper):
         state.info['episode_metrics'][metric_name] = jp.maximum(
             state.info['episode_metrics'][metric_name], state.metrics[metric_name]
         )
+        state.info['episode_metrics'][metric_name] *= (1 - prev_done)
       elif metric_name == 'jerk':
         # Accumulate metric during episode
         state.info['episode_metrics'][metric_name] += state.metrics[metric_name]
