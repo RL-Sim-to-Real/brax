@@ -217,12 +217,15 @@ def train(
     num_resets_per_eval: int = 0,
     normalize_observations: bool = False,
     normalize_observations_std_eps: float = 0.0,
+    normalize_observations_mode: str = "welford",
     reward_scaling: float = 1.0,
     clipping_epsilon: float = 0.3,
+    clipping_epsilon_value: float | None = None,
     gae_lambda: float = 0.95,
     max_grad_norm: Optional[float] = None,
     normalize_advantage: bool = True,
     vf_loss_coefficient: float = 0.5,
+    bootstrap_on_timeout: bool = False,
     desired_kl: float = 0.01,
     learning_rate_schedule: Optional[
         Union[str, ppo_optimizer.LRSchedule]
@@ -290,12 +293,19 @@ def train(
     normalize_observations: whether to normalize observations
     normalize_observations_std_eps: small value added to the standard deviation
       for obs normalization to improve numerical stability
+    normalize_observations_mode: method to use for running statistics, welford
+      is the default, but ema is more numerically stable for long training runs
     reward_scaling: float scaling for reward
     clipping_epsilon: clipping epsilon for PPO loss
+    clipping_epsilon_value: Value function loss clipping epsilon
     gae_lambda: General advantage estimation lambda
     max_grad_norm: gradient clipping norm value. If None, no clipping is done
     normalize_advantage: whether to normalize advantage estimate
     vf_loss_coefficient: Coefficient for value function loss.
+    bootstrap_on_timeout: if True, bootstrap value on time_out steps using
+      reward += gamma * V(s) * time_out. Environments should set
+      state.info['time_out'] = 1.0 and done=True for steps where the episode ends
+      due to a time_out.
     desired_kl: Desired KL divergence for adaptive KL divergence learning rate
       schedule.
     learning_rate_schedule: Learning rate schedule for the optimizer.
@@ -428,7 +438,10 @@ def train(
   ppo_network = network_factory(
       obs_shape, env.action_size, preprocess_observations_fn=normalize
   )
-  make_policy = ppo_networks.make_inference_fn(ppo_network)
+  make_policy = ppo_networks.make_inference_fn(
+      ppo_network,
+      compute_value=bootstrap_on_timeout or clipping_epsilon_value is not None,
+  )
 
   # Optimizer.
   base_optimizer = optax.adam(learning_rate=learning_rate)
@@ -458,15 +471,16 @@ def train(
       clipping_epsilon=clipping_epsilon,
       normalize_advantage=normalize_advantage,
       vf_coefficient=vf_loss_coefficient,
+      clipping_epsilon_value=clipping_epsilon_value,
   )
 
-  gradient_update_fn = gradients.gradient_update_fn(
-      loss_fn, optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True
+  loss_and_pgrad_fn = gradients.loss_and_pgrad(
+      loss_fn, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True
   )
 
+  steps_between_logging = training_metrics_steps or env_step_per_training_step
   metrics_aggregator = metric_logger.EpisodeMetricsLogger(
-      steps_between_logging=training_metrics_steps
-      or env_step_per_training_step,
+      steps_between_logging=steps_between_logging,
       progress_fn=progress_fn,
   )
 
@@ -477,22 +491,23 @@ def train(
   ):
     optimizer_state, params, key = carry
     key, key_loss = jax.random.split(key)
-    (_, metrics), params, optimizer_state = gradient_update_fn(
-        params,
-        normalizer_params,
-        data,
-        key_loss,
-        optimizer_state=optimizer_state,
+    (_, metrics), grads = loss_and_pgrad_fn(
+        params, normalizer_params, data, key_loss
     )
 
-    metrics['learning_rate'] = jnp.array(learning_rate, dtype=float)
     if lr_is_adaptive_kl:
       kl_mean = metrics['kl_mean']
       kl_mean = jax.lax.pmean(kl_mean, axis_name=_PMAP_AXIS_NAME)
       optimizer_state, lr = ppo_optimizer.adaptive_kl_learning_rate(
           optimizer_state, kl_mean, desired_kl
       )
-      metrics['learning_rate'] = lr
+    else:
+      lr = jnp.array(learning_rate)
+    metrics['learning_rate'] = lr
+
+    # apply gradients
+    params_update, optimizer_state = optimizer.update(grads, optimizer_state)
+    params = optax.apply_updates(params, params_update)
 
     return (optimizer_state, params, key), metrics
 
@@ -547,13 +562,16 @@ def train(
     def f(carry, unused_t):
       current_state, current_key = carry
       current_key, next_key = jax.random.split(current_key)
+      extra_fields = ['truncation', 'episode_metrics', 'episode_done']
+      if bootstrap_on_timeout:
+        extra_fields.append('time_out')
       next_state, data = acting.generate_unroll(
           env,
           current_state,
           policy,
           current_key,
           unroll_length,
-          extra_fields=('truncation', 'episode_metrics', 'episode_done'),
+          extra_fields=tuple(extra_fields),
       )
       return (next_state, next_key), data
 
@@ -569,6 +587,18 @@ def train(
         lambda x: jnp.reshape(x, (-1,) + x.shape[2:]), data
     )
     assert data.discount.shape[1:] == (unroll_length,)
+
+    if bootstrap_on_timeout:  # bootstrap reward on timeout
+      time_out = data.extras['state_extras']['time_out']
+      value = data.extras['policy_extras']['value']
+      data = types.Transition(
+          observation=data.observation,
+          action=data.action,
+          reward=data.reward + discounting * time_out * value,
+          discount=data.discount,
+          next_observation=data.next_observation,
+          extras=data.extras,
+      )
 
     normalizer_params = training_state.normalizer_params
     if not lr_is_adaptive_kl:
@@ -675,7 +705,9 @@ def train(
       optimizer_state=optimizer.init(init_params),  # pytype: disable=wrong-arg-types  # numpy-scalars
       params=init_params,
       normalizer_params=running_statistics.init_state(
-          _remove_pixels(obs_shape), std_eps=normalize_observations_std_eps
+          _remove_pixels(obs_shape),
+          std_eps=normalize_observations_std_eps,
+          mode=normalize_observations_mode,
       ),
       env_steps=types.UInt64(hi=0, lo=0),
   )

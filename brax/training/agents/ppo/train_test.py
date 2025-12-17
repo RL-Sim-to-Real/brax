@@ -55,12 +55,24 @@ class PPOTest(parameterized.TestCase):
     )
     self.assertGreater(metrics['eval/episode_reward'], 135)
 
-  @parameterized.parameters(
-      ('normal', 'scalar'),
-      ('normal', 'log'),
-      ('tanh_normal', 'log'),
+  @parameterized.product(
+      (
+          dict(distribution_type='normal', noise_std_type='scalar'),
+          dict(distribution_type='normal', noise_std_type='log'),
+          dict(distribution_type='tanh_normal', noise_std_type='log'),
+      ),
+      normalize_mode=['welford', 'ema'],
+      bootstrap_on_timeout=[True, False],
+      clipping_epsilon_value=[None, 0.1],
   )
-  def testTrainWithNetworkParams(self, distribution_type, noise_std_type):
+  def testTrainWithNetworkParams(
+      self,
+      distribution_type,
+      noise_std_type,
+      normalize_mode,
+      bootstrap_on_timeout,
+      clipping_epsilon_value,
+  ):
     """Test PPO runs with different network params."""
     network_factory = functools.partial(
         ppo_networks.make_ppo_networks,
@@ -93,6 +105,9 @@ class PPOTest(parameterized.TestCase):
         normalize_advantage=False,
         network_factory=network_factory,
         learning_rate_schedule='ADAPTIVE_KL',
+        normalize_observations_mode=normalize_mode,
+        bootstrap_on_timeout=bootstrap_on_timeout,
+        clipping_epsilon_value=clipping_epsilon_value,
     )
 
   def testTrainAsymmetricActorCritic(self):
