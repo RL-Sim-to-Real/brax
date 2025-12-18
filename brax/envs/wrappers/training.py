@@ -122,24 +122,24 @@ class EpisodeWrapper(Wrapper):
     state.info['episode_metrics']['length'] += self.action_repeat
     state.info['episode_metrics']['length'] *= (1 - prev_done)
     # jax.debug.print(state.metrics.keys())
-    accumulate_and_normalize_metrics = ['cube_collision', 'floor_collision']
+    # accumulate_and_normalize_metrics = ['cube_collision', 'floor_collision']
     for metric_name in state.metrics.keys():
-      if metric_name in accumulate_and_normalize_metrics:
-        # Accumulate metric during episode
-        state.info['episode_metrics'][metric_name] += state.metrics[metric_name]
-        state.info['episode_metrics'][metric_name] *= (1 - prev_done)
-        # Normalize only at episode end
-        state.info['episode_metrics'][metric_name] = jp.where(
-            done,
-            state.info['episode_metrics'][metric_name] / jp.maximum(state.info['episode_metrics']['length'], 1),
-            state.info['episode_metrics'][metric_name]
-        )
-      elif metric_name == 'success':
+      # if metric_name in accumulate_and_normalize_metrics:
+      #   # Accumulate metric during episode
+      #   state.info['episode_metrics'][metric_name] += state.metrics[metric_name]
+      #   state.info['episode_metrics'][metric_name] *= (1 - prev_done)
+      #   # Normalize only at episode end
+      #   state.info['episode_metrics'][metric_name] = jp.where(
+      #       done,
+      #       state.info['episode_metrics'][metric_name] / jp.maximum(state.info['episode_metrics']['length'], 1),
+      #       state.info['episode_metrics'][metric_name]
+      #   )
+      if metric_name == 'success':
         state.info['episode_metrics'][metric_name] = jp.maximum(
             state.info['episode_metrics'][metric_name], state.metrics[metric_name]
         )
         state.info['episode_metrics'][metric_name] *= (1 - prev_done)
-      elif metric_name == 'jerk':
+      elif metric_name == 'jerk': # it's jerk_per_step now and being handled by brax
         # Accumulate metric during episode
         state.info['episode_metrics'][metric_name] += state.metrics[metric_name]
         state.info['episode_metrics'][metric_name] *= (1 - prev_done)
