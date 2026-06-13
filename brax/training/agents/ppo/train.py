@@ -34,6 +34,7 @@ from brax.training.acme import specs
 from brax.training.agents.ppo import checkpoint
 from brax.training.agents.ppo import losses as ppo_losses
 from brax.training.agents.ppo import networks as ppo_networks
+from brax.training.agents.ppo import optimizer as ppo_optimizer
 from brax.training.types import Params
 from brax.training.types import PRNGKey
 import flax
@@ -41,7 +42,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-
 
 InferenceParams = Tuple[running_statistics.NestedMeanStd, Params]
 Metrics = types.Metrics
@@ -216,15 +216,25 @@ def train(
     num_updates_per_batch: int = 2,
     num_resets_per_eval: int = 0,
     normalize_observations: bool = False,
+    normalize_observations_std_eps: float = 0.0,
+    normalize_observations_mode: str = "welford",
     reward_scaling: float = 1.0,
     clipping_epsilon: float = 0.3,
+    clipping_epsilon_value: float | None = None,
     gae_lambda: float = 0.95,
     max_grad_norm: Optional[float] = None,
     normalize_advantage: bool = True,
+    vf_loss_coefficient: float = 0.5,
+    bootstrap_on_timeout: bool = False,
+    desired_kl: float = 0.01,
+    learning_rate_schedule: Optional[
+        Union[str, ppo_optimizer.LRSchedule]
+    ] = None,
     network_factory: types.NetworkFactory[
         ppo_networks.PPONetworks
     ] = ppo_networks.make_ppo_networks,
     seed: int = 0,
+    use_pmap_on_reset: bool = True,
     # eval
     num_evals: int = 1,
     eval_env: Optional[envs.Env] = None,
@@ -281,11 +291,24 @@ def train(
     num_resets_per_eval: the number of environment resets to run between each
       eval. The environment resets occur on the host
     normalize_observations: whether to normalize observations
+    normalize_observations_std_eps: small value added to the standard deviation
+      for obs normalization to improve numerical stability
+    normalize_observations_mode: method to use for running statistics, welford
+      is the default, but ema is more numerically stable for long training runs
     reward_scaling: float scaling for reward
     clipping_epsilon: clipping epsilon for PPO loss
+    clipping_epsilon_value: Value function loss clipping epsilon
     gae_lambda: General advantage estimation lambda
     max_grad_norm: gradient clipping norm value. If None, no clipping is done
     normalize_advantage: whether to normalize advantage estimate
+    vf_loss_coefficient: Coefficient for value function loss.
+    bootstrap_on_timeout: if True, bootstrap value on time_out steps using
+      reward += gamma * V(s) * time_out. Environments should set
+      state.info['time_out'] = 1.0 and done=True for steps where the episode ends
+      due to a time_out.
+    desired_kl: Desired KL divergence for adaptive KL divergence learning rate
+      schedule.
+    learning_rate_schedule: Learning rate schedule for the optimizer.
     network_factory: function that generates networks for policy and value
       functions
     seed: random seed
@@ -313,6 +336,8 @@ def train(
     run_evals: if True, use the evaluator num_eval times to collect distinct
       eval rollouts. If False, num_eval_envs and eval_env are ignored.
       progress_fn is then expected to use training_metrics.
+    use_pmap_on_reset: default to True. if True, use pmap instead of vmap for
+      env.reset across devices.
 
   Returns:
     Tuple of (make_policy function, network params, metrics)
@@ -381,15 +406,29 @@ def train(
       wrap_env_fn,
       randomization_fn,
   )
-  if local_devices_to_use > 1:
-    reset_fn = jax.pmap(env.reset, axis_name=_PMAP_AXIS_NAME)
-  else:
-    reset_fn = jax.jit(jax.vmap(env.reset))
+
+  def reset_fn_donated_env_state(env_state_donated, key_envs):
+    return env.reset(key_envs)
+
   key_envs = jax.random.split(key_env, num_envs // process_count)
   key_envs = jnp.reshape(
       key_envs, (local_devices_to_use, -1) + key_envs.shape[1:]
   )
-  env_state = reset_fn(key_envs)
+  if local_devices_to_use > 1 or use_pmap_on_reset:
+    reset_fn_ = jax.pmap(env.reset, axis_name=_PMAP_AXIS_NAME)
+    env_state = reset_fn_(key_envs)
+    reset_fn = jax.pmap(
+        reset_fn_donated_env_state,
+        axis_name=_PMAP_AXIS_NAME,
+        donate_argnums=(0,),
+    )
+  else:
+    reset_fn_ = jax.jit(jax.vmap(env.reset))
+    env_state = reset_fn_(key_envs)
+    reset_fn = jax.jit(
+        reset_fn_donated_env_state, donate_argnums=(0,), keep_unused=True
+    )
+
   # Discard the batch axes over devices and envs.
   obs_shape = jax.tree_util.tree_map(lambda x: x.shape[2:], env_state.obs)
 
@@ -399,15 +438,28 @@ def train(
   ppo_network = network_factory(
       obs_shape, env.action_size, preprocess_observations_fn=normalize
   )
-  make_policy = ppo_networks.make_inference_fn(ppo_network)
+  make_policy = ppo_networks.make_inference_fn(
+      ppo_network,
+      compute_value=bootstrap_on_timeout or clipping_epsilon_value is not None,
+  )
 
-  optimizer = optax.adam(learning_rate=learning_rate)
+  # Optimizer.
+  base_optimizer = optax.adam(learning_rate=learning_rate)
+  lr_schedule = learning_rate_schedule or ppo_optimizer.LRSchedule.NONE
+  lr_schedule = ppo_optimizer.LRSchedule(lr_schedule)
+  lr_is_adaptive_kl = lr_schedule == ppo_optimizer.LRSchedule.ADAPTIVE_KL
+  if lr_is_adaptive_kl:
+    base_optimizer = optax.inject_hyperparams(optax.adam)(
+        learning_rate=learning_rate
+    )
   if max_grad_norm is not None:
-    # TODO: Move gradient clipping to `training/gradients.py`.
+    # TODO(btaba): Move gradient clipping to `training/gradients.py`.
     optimizer = optax.chain(
         optax.clip_by_global_norm(max_grad_norm),
-        optax.adam(learning_rate=learning_rate),
+        base_optimizer,
     )
+  else:
+    optimizer = base_optimizer
 
   loss_fn = functools.partial(
       ppo_losses.compute_ppo_loss,
@@ -418,15 +470,17 @@ def train(
       gae_lambda=gae_lambda,
       clipping_epsilon=clipping_epsilon,
       normalize_advantage=normalize_advantage,
+      vf_coefficient=vf_loss_coefficient,
+      clipping_epsilon_value=clipping_epsilon_value,
   )
 
-  gradient_update_fn = gradients.gradient_update_fn(
-      loss_fn, optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True
+  loss_and_pgrad_fn = gradients.loss_and_pgrad(
+      loss_fn, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True
   )
 
+  steps_between_logging = training_metrics_steps or env_step_per_training_step
   metrics_aggregator = metric_logger.EpisodeMetricsLogger(
-      steps_between_logging=training_metrics_steps
-      or env_step_per_training_step,
+      steps_between_logging=steps_between_logging,
       progress_fn=progress_fn,
   )
 
@@ -437,13 +491,23 @@ def train(
   ):
     optimizer_state, params, key = carry
     key, key_loss = jax.random.split(key)
-    (_, metrics), params, optimizer_state = gradient_update_fn(
-        params,
-        normalizer_params,
-        data,
-        key_loss,
-        optimizer_state=optimizer_state,
+    (_, metrics), grads = loss_and_pgrad_fn(
+        params, normalizer_params, data, key_loss
     )
+
+    if lr_is_adaptive_kl:
+      kl_mean = metrics['kl_mean']
+      kl_mean = jax.lax.pmean(kl_mean, axis_name=_PMAP_AXIS_NAME)
+      optimizer_state, lr = ppo_optimizer.adaptive_kl_learning_rate(
+          optimizer_state, kl_mean, desired_kl
+      )
+    else:
+      lr = jnp.array(learning_rate)
+    metrics['learning_rate'] = lr
+
+    # apply gradients
+    params_update, optimizer_state = optimizer.update(grads, optimizer_state)
+    params = optax.apply_updates(params, params_update)
 
     return (optimizer_state, params, key), metrics
 
@@ -460,11 +524,11 @@ def train(
       key, key_rt = jax.random.split(key)
       r_translate = functools.partial(_random_translate_pixels, key=key_rt)
       data = types.Transition(
-          observation=r_translate(data.observation),
+          observation=r_translate(data.observation),  # pytype: disable=wrong-arg-types
           action=data.action,
           reward=data.reward,
           discount=data.discount,
-          next_observation=r_translate(data.next_observation),
+          next_observation=r_translate(data.next_observation),  # pytype: disable=wrong-arg-types
           extras=data.extras,
       )
 
@@ -480,6 +544,7 @@ def train(
         shuffled_data,
         length=num_minibatches,
     )
+
     return (optimizer_state, params, key), metrics
 
   def training_step(
@@ -497,13 +562,16 @@ def train(
     def f(carry, unused_t):
       current_state, current_key = carry
       current_key, next_key = jax.random.split(current_key)
+      extra_fields = ['truncation', 'episode_metrics', 'episode_done']
+      if bootstrap_on_timeout:
+        extra_fields.append('time_out')
       next_state, data = acting.generate_unroll(
           env,
           current_state,
           policy,
           current_key,
           unroll_length,
-          extra_fields=('truncation', 'episode_metrics', 'episode_done'),
+          extra_fields=tuple(extra_fields),
       )
       return (next_state, next_key), data
 
@@ -520,19 +588,26 @@ def train(
     )
     assert data.discount.shape[1:] == (unroll_length,)
 
-    if log_training_metrics:  # log unroll metrics
-      jax.debug.callback(
-          metrics_aggregator.update_episode_metrics,
-          data.extras['state_extras']['episode_metrics'],
-          data.extras['state_extras']['episode_done'],
+    if bootstrap_on_timeout:  # bootstrap reward on timeout
+      time_out = data.extras['state_extras']['time_out']
+      value = data.extras['policy_extras']['value']
+      data = types.Transition(
+          observation=data.observation,
+          action=data.action,
+          reward=data.reward + discounting * time_out * value,
+          discount=data.discount,
+          next_observation=data.next_observation,
+          extras=data.extras,
       )
 
-    # Update normalization params and normalize observations.
-    normalizer_params = running_statistics.update(
-        training_state.normalizer_params,
-        _remove_pixels(data.observation),
-        pmap_axis_name=_PMAP_AXIS_NAME,
-    )
+    normalizer_params = training_state.normalizer_params
+    if not lr_is_adaptive_kl:
+      # Update normalization params before SGD for backwards compatibility.
+      normalizer_params = running_statistics.update(
+          normalizer_params,
+          _remove_pixels(data.observation),
+          pmap_axis_name=_PMAP_AXIS_NAME,
+      )
 
     (optimizer_state, params, _), metrics = jax.lax.scan(
         functools.partial(
@@ -543,12 +618,30 @@ def train(
         length=num_updates_per_batch,
     )
 
+    if lr_is_adaptive_kl:
+      # For adaptive KL, normalization params should be updated after SGD s.t.
+      # old distribution outputs are valid for KL computation.
+      normalizer_params = running_statistics.update(
+          normalizer_params,
+          _remove_pixels(data.observation),
+          pmap_axis_name=_PMAP_AXIS_NAME,
+      )
+
     new_training_state = TrainingState(
         optimizer_state=optimizer_state,
         params=params,
         normalizer_params=normalizer_params,
         env_steps=training_state.env_steps + env_step_per_training_step,
     )
+
+    if log_training_metrics:  # log unroll metrics
+      jax.debug.callback(
+          metrics_aggregator.update_episode_metrics,
+          data.extras['state_extras']['episode_metrics'],
+          data.extras['state_extras']['episode_done'],
+          metrics,
+      )
+
     return (new_training_state, state, new_key), metrics
 
   def training_epoch(
@@ -563,7 +656,14 @@ def train(
     loss_metrics = jax.tree_util.tree_map(jnp.mean, loss_metrics)
     return training_state, state, loss_metrics
 
-  training_epoch = jax.pmap(training_epoch, axis_name=_PMAP_AXIS_NAME)
+  training_epoch = jax.pmap(
+      training_epoch,
+      axis_name=_PMAP_AXIS_NAME,
+      donate_argnums=(
+          0,
+          1,
+      ),
+  )
 
   # Note that this is NOT a pure jittable method.
   def training_epoch_with_timing(
@@ -605,7 +705,9 @@ def train(
       optimizer_state=optimizer.init(init_params),  # pytype: disable=wrong-arg-types  # numpy-scalars
       params=init_params,
       normalizer_params=running_statistics.init_state(
-          _remove_pixels(obs_shape)
+          _remove_pixels(obs_shape),
+          std_eps=normalize_observations_std_eps,
+          mode=normalize_observations_mode,
       ),
       env_steps=types.UInt64(hi=0, lo=0),
   )
@@ -706,8 +808,9 @@ def train(
       key_envs = jax.vmap(
           lambda x, s: jax.random.split(x[0], s), in_axes=(0, None)
       )(key_envs, key_envs.shape[1])
-      # TODO: move extra reset logic to the AutoResetWrapper.
-      env_state = reset_fn(key_envs) if num_resets_per_eval > 0 else env_state
+      # TODO(brax-team): move extra reset logic to the AutoResetWrapper.
+      if num_resets_per_eval > 0:
+        env_state = reset_fn(env_state, key_envs)
 
     if process_id != 0:
       continue

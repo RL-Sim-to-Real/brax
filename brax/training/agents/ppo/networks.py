@@ -14,7 +14,7 @@
 
 """PPO networks."""
 
-from typing import Literal, Sequence, Tuple
+from typing import Any, Literal, Mapping, Sequence, Tuple
 
 from brax.training import distribution
 from brax.training import networks
@@ -22,6 +22,7 @@ from brax.training import types
 from brax.training.types import PRNGKey
 import flax
 from flax import linen
+import jax
 
 
 @flax.struct.dataclass
@@ -31,8 +32,13 @@ class PPONetworks:
   parametric_action_distribution: distribution.ParametricDistribution
 
 
-def make_inference_fn(ppo_networks: PPONetworks):
-  """Creates params and inference function for the PPO agent."""
+def make_inference_fn(ppo_networks: PPONetworks, compute_value: bool = False):
+  """Creates params and inference function for the PPO agent.
+
+  Args:
+    ppo_networks: The PPO networks.
+    compute_value: If True, compute value during rollouts.
+  """
 
   def make_policy(
       params: types.Params, deterministic: bool = False
@@ -54,10 +60,16 @@ def make_inference_fn(ppo_networks: PPONetworks):
       postprocessed_actions = parametric_action_distribution.postprocess(
           raw_actions
       )
-      return postprocessed_actions, {
+      extras = {
           'log_prob': log_prob,
           'raw_action': raw_actions,
+          'distribution_params': logits,
       }
+      if compute_value:
+        extras['value'] = ppo_networks.value_network.apply(
+            params[0], params[2], observations
+        )
+      return postprocessed_actions, extras
 
     return policy
 
@@ -77,8 +89,15 @@ def make_ppo_networks(
     noise_std_type: Literal['scalar', 'log'] = 'scalar',
     init_noise_std: float = 1.0,
     state_dependent_std: bool = False,
+    policy_network_kernel_init_fn: networks.Initializer = jax.nn.initializers.lecun_uniform,
+    policy_network_kernel_init_kwargs: Mapping[str, Any] | None = None,
+    value_network_kernel_init_fn: networks.Initializer = jax.nn.initializers.lecun_uniform,
+    value_network_kernel_init_kwargs: Mapping[str, Any] | None = None,
 ) -> PPONetworks:
   """Make PPO networks with preprocessor."""
+  policy_kernel_init_kwargs = policy_network_kernel_init_kwargs or {}
+  value_kernel_init_kwargs = value_network_kernel_init_kwargs or {}
+
   parametric_action_distribution: distribution.ParametricDistribution
   if distribution_type == 'normal':
     parametric_action_distribution = distribution.NormalDistribution(
@@ -104,6 +123,7 @@ def make_ppo_networks(
       noise_std_type=noise_std_type,
       init_noise_std=init_noise_std,
       state_dependent_std=state_dependent_std,
+      kernel_init=policy_network_kernel_init_fn(**policy_kernel_init_kwargs),
   )
   value_network = networks.make_value_network(
       observation_size,
@@ -111,6 +131,7 @@ def make_ppo_networks(
       hidden_layer_sizes=value_hidden_layer_sizes,
       activation=activation,
       obs_key=value_obs_key,
+      kernel_init=value_network_kernel_init_fn(**value_kernel_init_kwargs),
   )
 
   return PPONetworks(

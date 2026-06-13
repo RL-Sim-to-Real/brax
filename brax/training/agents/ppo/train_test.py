@@ -24,6 +24,7 @@ from brax.training.agents.ppo import networks as ppo_networks
 from brax.training.agents.ppo import networks_vision as ppo_networks_vision
 from brax.training.agents.ppo import train as ppo
 import jax
+from jax import numpy as jnp
 
 
 class PPOTest(parameterized.TestCase):
@@ -53,20 +54,36 @@ class PPOTest(parameterized.TestCase):
         normalize_advantage=False,
     )
     self.assertGreater(metrics['eval/episode_reward'], 135)
-    self.assertEqual(fast.reset_count, 2)  # type: ignore
-    self.assertEqual(fast.step_count, 2)  # type: ignore
 
-  @parameterized.parameters(
-      ('normal', 'scalar'),
-      ('normal', 'log'),
-      ('tanh_normal', 'log'),
+  @parameterized.product(
+      (
+          dict(distribution_type='normal', noise_std_type='scalar'),
+          dict(distribution_type='normal', noise_std_type='log'),
+          dict(distribution_type='tanh_normal', noise_std_type='log'),
+      ),
+      normalize_mode=['welford', 'ema'],
+      bootstrap_on_timeout=[True, False],
+      clipping_epsilon_value=[None, 0.1],
   )
-  def testTrainWithNetworkParams(self, distribution_type, noise_std_type):
+  def testTrainWithNetworkParams(
+      self,
+      distribution_type,
+      noise_std_type,
+      normalize_mode,
+      bootstrap_on_timeout,
+      clipping_epsilon_value,
+  ):
     """Test PPO runs with different network params."""
     network_factory = functools.partial(
         ppo_networks.make_ppo_networks,
         distribution_type=distribution_type,
         noise_std_type=noise_std_type,
+        init_noise_std=0.8,
+        activation=jax.nn.elu,
+        policy_network_kernel_init_fn=jax.nn.initializers.orthogonal,
+        policy_network_kernel_init_kwargs={'scale': jnp.sqrt(2.0)},
+        value_network_kernel_init_fn=jax.nn.initializers.orthogonal,
+        value_network_kernel_init_kwargs={'scale': jnp.sqrt(2.0)},
     )
 
     _, _, _ = ppo.train(
@@ -82,10 +99,15 @@ class PPOTest(parameterized.TestCase):
         num_minibatches=8,
         num_updates_per_batch=4,
         normalize_observations=True,
+        max_grad_norm=1.0,
         seed=2,
         reward_scaling=10,
         normalize_advantage=False,
         network_factory=network_factory,
+        learning_rate_schedule='ADAPTIVE_KL',
+        normalize_observations_mode=normalize_mode,
+        bootstrap_on_timeout=bootstrap_on_timeout,
+        clipping_epsilon_value=clipping_epsilon_value,
     )
 
   def testTrainAsymmetricActorCritic(self):

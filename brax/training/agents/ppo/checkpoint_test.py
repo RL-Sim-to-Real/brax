@@ -23,6 +23,7 @@ from brax.training.agents.ppo import checkpoint
 from brax.training.agents.ppo import losses as ppo_losses
 from brax.training.agents.ppo import networks as ppo_networks
 from etils import epath
+import flax
 import jax
 from jax import numpy as jp
 
@@ -56,6 +57,10 @@ class CheckpointTest(absltest.TestCase):
     network_factory = functools.partial(
         ppo_networks.make_ppo_networks,
         policy_hidden_layer_sizes=(16, 21, 13),
+        activation=flax.linen.relu,
+        policy_network_kernel_init_fn=jax.nn.initializers.orthogonal,
+        policy_network_kernel_init_kwargs={"scale": jp.sqrt(2.0)},
+        value_network_kernel_init_fn=jax.nn.initializers.glorot_uniform,
     )
     config = checkpoint.network_config(
         observation_size=1,
@@ -80,7 +85,8 @@ class CheckpointTest(absltest.TestCase):
         value=ppo_network.value_network.init(dummy_key),
     )
     normalizer_params = running_statistics.init_state(
-        jax.tree_util.tree_map(jp.zeros, config.observation_size)
+        jax.tree_util.tree_map(jp.zeros, config.observation_size),
+        std_eps=0.02,
     )
     params = (normalizer_params, network_params.policy, network_params.value)
 
@@ -97,6 +103,10 @@ class CheckpointTest(absltest.TestCase):
     )
     out = policy_fn(jp.zeros(1), jax.random.PRNGKey(0))
     self.assertEqual(out[0].shape, (3,))
+
+    loaded_params = checkpoint.load(epath.Path(path.full_path) / "000000000001")
+    loaded_normalizer = loaded_params[0]
+    self.assertEqual(loaded_normalizer.std_eps, 0.02)
 
 
 if __name__ == "__main__":
